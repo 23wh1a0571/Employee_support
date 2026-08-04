@@ -6,18 +6,12 @@ from pydantic import BaseModel
 from app.agent.graph import build_agent
 
 router = APIRouter()
-
 _mcp_tools = None
 
 async def get_tools():
     global _mcp_tools
     if _mcp_tools is None:
         _, _mcp_tools = await build_agent()
-        print("\n==================================================")
-        print("🔧 REGISTERED MCP TOOLS:")
-        for t in _mcp_tools:
-            print(f"  • {t.name}")
-        print("==================================================\n")
     return _mcp_tools
 
 class ChatRequest(BaseModel):
@@ -27,89 +21,108 @@ class ChatResponse(BaseModel):
     response: str
 
 def extract_emp_id(text: str) -> Optional[str]:
-    """Extracts employee IDs and preserves hyphen formatting like EMP-001 or EMP-023."""
     match = re.search(r'EMP[-_\s]?(\d+)', text, re.IGNORECASE)
     if match:
-        num = int(match.group(1))
-        return f"EMP-{num:03d}"
+        return f"EMP-{int(match.group(1)):03d}"
     return None
 
 def extract_ticket_id(text: str) -> Optional[str]:
-    """Extracts ticket IDs like TCK-1001 or TCK-1002."""
     match = re.search(r'TCK[-_\s]?(\d+)', text, re.IGNORECASE)
     if match:
-        num = int(match.group(1))
-        return f"TCK-{num}"
+        return f"TCK-{int(match.group(1))}"
     return None
+
+def extract_days(text: str) -> int:
+    match = re.search(r'(\d+)\s*days?', text, re.IGNORECASE)
+    return int(match.group(1)) if match else 1
+
+def extract_software_name(text: str) -> str:
+    cleaned = re.sub(r'EMP[-_\s]?\d+', '', text, flags=re.IGNORECASE)
+    cleaned = re.sub(r'\b(need|access|to|software|for|request|provision|grant|license|app|i)\b', '', cleaned, flags=re.IGNORECASE).strip()
+    return cleaned
 
 async def direct_mcp_executor(user_msg: str, tools) -> str:
     msg = user_msg.lower().strip()
-    
-    # 1. Greetings
-    if msg in ["hi", "hii", "hello", "hey", "how are you", "how are you?"]:
-        return "Hello! I am your Enterprise HR & IT Assistant running on pure MCP. How can I help you today?"
-
     tool_dict = {t.name.lower(): t for t in tools} if tools else {}
-    
     emp_id = extract_emp_id(user_msg)
     ticket_id = extract_ticket_id(user_msg)
 
-    # 2. Payslips / Payroll / Salary
-    if any(w in msg for w in ["payslip", "salary", "take-home", "take home", "pay", "deduction", "allowance"]):
-        target_id = emp_id or "EMP-001"
-        for name, tool in tool_dict.items():
-            if "payslip" in name or "salary" in name or "pay" in name:
-                return await tool.ainvoke({"emp_id": target_id})
+    # 1. SUPPORT DOMAIN
+    if "close" in msg and "ticket" in msg:
+        if not ticket_id:
+            return "Please specify the **Ticket ID** you want to close (e.g., `TCK-1001`)."
+        return await tool_dict["close_support_ticket"].ainvoke({"ticket_id": ticket_id})
 
-    # 3. Password Reset / Login Issues
-    if any(w in msg for w in ["password", "reset", "logout", "logged out", "sso", "login", "log in", "sign in", "cant log", "cannot log", "locked", "account"]):
+    if ("check" in msg or "view" in msg or "status" in msg) and ("ticket" in msg or ticket_id):
+        if not ticket_id:
+            return "Please specify the **Ticket ID** you would like to check (e.g., `TCK-1001`)."
+        return await tool_dict["check_ticket_status"].ainvoke({"ticket_id": ticket_id})
+
+    if any(w in msg for w in ["ticket", "charger", "broken", "laptop", "mouse", "keyboard", "screen", "issue", "raise"]):
         if not emp_id:
-            return "Please provide your Employee ID (e.g., EMP-001) so I can generate a password reset link for your account."
-        for name, tool in tool_dict.items():
-            if "password" in name or "reset" in name or "sso" in name:
-                return await tool.ainvoke({"emp_id": emp_id})
+            return "Please provide your **Employee ID** (e.g., `EMP-012`) so I can log this support ticket for you."
+        title = re.sub(r'EMP[-_\s]?\d+', '', user_msg, flags=re.IGNORECASE).strip()
+        title = re.sub(r'\b(can|you|add|create|raise|ticket|for|i|have|my)\b', '', title, flags=re.IGNORECASE).strip()
+        title = title.capitalize() if title else "Hardware Issue"
+        return await tool_dict["create_support_ticket"].ainvoke({"emp_id": emp_id, "title": title, "category": "Hardware"})
 
-    # 4. Leave Balance / PTO / Vacation / Holidays / Days Off
-    if any(w in msg for w in ["leave", "pto", "balance", "vacation", "annual", "sick", "holiday", "holidays", "off", "day off"]):
-        target_id = emp_id or "EMP-001"
-        for name, tool in tool_dict.items():
-            if "leave" in name or "pto" in name or "balance" in name:
-                return await tool.ainvoke({"emp_id": target_id})
+    # 2. POLICY & DOCUMENT SEARCH (RAG)
+    if any(w in msg for w in ["policy", "reimbursement", "parental", "byod", "allowance", "handbook", "rule"]):
+        return await tool_dict["query_company_policy"].ainvoke({"query": user_msg})
 
-    # 5. IT Support Tickets
-    if any(w in msg for w in ["ticket", "tck", "issue", "status", "support"]):
-        target_ticket = ticket_id or "TCK-1001"
-        for name, tool in tool_dict.items():
-            if "ticket" in name or "tck" in name:
-                return await tool.ainvoke({"ticket_id": target_ticket})
+    # 3. HR DOMAIN - LEAVE APPLICATION (Priority)
+    if any(w in msg for w in ["apply", "take", "need", "request", "have", "want", "get", "can i"]) and any(w in msg for w in ["leave", "holiday", "pto", "vacation", "time off"]) and extract_days(user_msg) > 0:
+        if not emp_id:
+            return "To submit a leave request for your manager's review, please specify your **Employee ID** (e.g., `EMP-012`)."
+        days = extract_days(user_msg)
+        l_type = "Sick" if "sick" in msg else ("Casual" if "casual" in msg else "Annual")
+        return await tool_dict["apply_leave"].ainvoke({"emp_id": emp_id, "days": days, "leave_type": l_type})
 
-    # 6. Software Access Requests
-    if any(w in msg for w in ["software", "request", "figma", "jira", "access"]):
-        target_id = emp_id or "EMP-001"
-        for name, tool in tool_dict.items():
-            if "software" in name or "access" in name or "request" in name:
-                return await tool.ainvoke({"emp_id": target_id})
+    # 4. HR DOMAIN - LEAVE BALANCE CHECK (Includes "tell me the leaves", "show leaves", etc.)
+    if any(w in msg for w in ["leaves", "leave", "pto", "balance", "how many days", "remaining"]):
+        if not emp_id:
+            return "Please provide your **Employee ID** (e.g., `EMP-012`) so I can retrieve your leave balance."
+        return await tool_dict["check_leave_balance"].ainvoke({"emp_id": emp_id})
 
-    # Default fallback help menu
+    if "payslip" in msg or "salary" in msg or "download payslip" in msg:
+        if not emp_id:
+            return "Please provide your **Employee ID** (e.g., `EMP-012`) to view or download your payslip."
+        return await tool_dict["get_payslip_details"].ainvoke({"emp_id": emp_id})
+
+    # 5. IT DOMAIN - SOFTWARE ACCESS REQUEST
+    if any(w in msg for w in ["software", "application", "tool", "license", "access to"]):
+        if not emp_id:
+            return "Please provide your **Employee ID** (e.g., `EMP-012`) to request software access."
+        sw_name = extract_software_name(user_msg)
+        return await tool_dict["request_software_access"].ainvoke({"emp_id": emp_id, "software_name": sw_name})
+
+    # 6. IT DOMAIN - UNLOCK & PASSWORD RESET
+    if "unlock" in msg and "account" in msg:
+        if not emp_id:
+            return "Please provide your **Employee ID** (e.g., `EMP-012`) to request an account unlock."
+        return await tool_dict["unlock_user_account"].ainvoke({"emp_id": emp_id})
+
+    if "password" in msg or "reset" in msg:
+        if not emp_id:
+            return "Please provide your **Employee ID** (e.g., `EMP-012`) to generate an SSO password reset link."
+        return await tool_dict["generate_password_reset_link"].ainvoke({"emp_id": emp_id})
+
     return (
-        "I can help you with HR and IT tasks using direct MCP tools:\n"
-        "• Check Payslips: 'Give me payslip for EMP-006'\n"
-        "• Password Reset: 'Reset password for EMP-001'\n"
-        "• Leave Balance: 'Check leave balance for EMP-001'\n"
-        "• IT Support Tickets: 'Check status of ticket TCK-1001'"
+        "Enterprise Assistant ready:\n\n"
+        "• **HR:** 'Check leave balance for EMP-012', 'Download payslip for EMP-012'\n"
+        "• **IT:** 'Unlock account for EMP-012', 'Request Figma software access for EMP-012'\n"
+        "• **Support:** 'Add a ticket that laptop charger is broken for EMP-015'\n"
+        "• **Policy Search:** 'What is our parental leave policy?'"
     )
 
 @router.post("/chat", response_model=ChatResponse)
 async def chat_endpoint(request: ChatRequest):
     if not request.message or not request.message.strip():
         raise HTTPException(status_code=400, detail="Message string cannot be empty.")
-
     tools = await get_tools()
-
     try:
         output_message = await direct_mcp_executor(request.message, tools)
         return ChatResponse(response=str(output_message))
     except Exception as e:
-        print("\n--- MCP EXECUTION ERROR TRACEBACK ---")
         traceback.print_exc()
-        raise HTTPException(status_code=500, detail=f"MCP Execution Error: {str(e)}")
+        raise HTTPException(status_code=500, detail=f"Execution Error: {str(e)}")
